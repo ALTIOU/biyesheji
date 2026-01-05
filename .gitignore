@@ -1,0 +1,44 @@
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual envs / conda
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# W&B runs (large, machine-specific)
+wandb/
+
+# Nested repo / external template (keep out of this repo)
+sysuthesis-unofficial/
+
+# Training outputs / checkpoints / models (large)
+project/models/
+project/**/checkpoint-*/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Caches
+.cache/
+**/.cache/
+**/.pytest_cache/
+
+# Logs
+*.log
+
