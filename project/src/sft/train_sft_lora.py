@@ -28,26 +28,27 @@ WandB 项目：sft_qwen3_lora
 import os
 import json
 from datetime import datetime
-import wandb
-from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, BitsAndBytesConfig
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+import argparse
+from pathlib import Path
+import warnings
+
+import torch
+
+from datasets import Dataset
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    DataCollatorForLanguageModeling,
+    Trainer,
+    TrainingArguments,
+)
+from peft import LoraConfig, get_peft_model
 
 # 设置环境变量，避免 OMP 冲突（Mac 环境需要）
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# WandB 配置
 WANDB_PROJECT = "sft_qwen3_lora"
-wandb.init(project=WANDB_PROJECT)
-
-# 路径配置
-SFT_DATA_PATH = "project/data/processed/sft_data.jsonl"
-BASE_MODEL = "Qwen/Qwen3-1.7B"
-
-# 创建带时间戳的输出目录
-timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-OUTPUT_DIR = f"project/models/sft/sft_{timestamp}"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def load_sft_dataset(path):
     data_list = []
@@ -59,133 +60,188 @@ def load_sft_dataset(path):
             data_list.append({"text": text})
     return data_list
 
-def tokenize(example):
-    # M2 Mac 测试配置 - 使用较短的序列长度以节省内存
-    result = tokenizer(example["text"], truncation=True, max_length=512)
-    result["labels"] = result["input_ids"].copy()  # 添加 labels 用于计算 loss
-    return result
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description="SFT (LoRA) 训练脚本")
+    parser.add_argument("--data_path", type=str, default="project/data/processed/sft_data.jsonl")
+    parser.add_argument("--base_model", type=str, default="Qwen/Qwen3-1.7B")
+    parser.add_argument("--output_dir", type=str, default=None, help="默认使用 project/models/sft/sft_<timestamp>")
+    parser.add_argument("--max_length", type=int, default=1024)
+    parser.add_argument("--max_train_samples", type=int, default=300, help="测试用：限制训练样本数；<=0 表示不限制")
+    parser.add_argument("--max_steps", type=int, default=0, help=">0 时覆盖 epochs，按 step 训练（适合冒烟/小跑）")
 
-    # 批量实验 GPU 配置（注释掉）：
-    # result = tokenizer(example["text"], truncation=True, max_length=1024)  # GPU 可以处理更长序列
-    # result["labels"] = result["input_ids"].copy()
-    # return result
+    parser.add_argument("--per_device_train_batch_size", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    parser.add_argument("--num_train_epochs", type=int, default=3)
+    parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--logging_steps", type=int, default=20)
+    parser.add_argument("--save_strategy", type=str, default="epoch", choices=["no", "steps", "epoch"])
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="开启以显著降低显存占用（推荐 GPU）")
+
+    parser.add_argument("--bf16", action="store_true", help="A100 推荐 bf16（默认开启）")
+    parser.add_argument("--fp16", action="store_true", help="如果不支持 bf16，可用 fp16")
+
+    parser.add_argument("--report_to", type=str, default="wandb", choices=["none", "wandb"])
+    parser.add_argument("--wandb_project", type=str, default=WANDB_PROJECT)
+    parser.add_argument("--run_name", type=str, default=None)
+
+    # LoRA 超参（为了支持 tiny 模型冒烟跑通，以及后续快速调参）
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="q_proj,v_proj",
+        help="逗号分隔。例如 Qwen: q_proj,v_proj；GPT2: c_attn",
+    )
+    parser.add_argument(
+        "--init_from_config",
+        action="store_true",
+        help="仅从 config 随机初始化模型（不加载权重）。用于无卡/低内存/torch.load 受限环境冒烟跑通。",
+    )
+    return parser
 
 if __name__ == "__main__":
-    print(f"📁 输出目录: {OUTPUT_DIR}")
-    print("🔧 Loading tokenizer & model...")
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
-    # M2 Mac 测试配置 - CPU 训练，不使用量化以确保兼容性
-    model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL,
-        trust_remote_code=True,
-        # device_map="auto",  # CPU 训练不需要
-        torch_dtype="float32"  # CPU 模式使用 float32
-    )
+    args = build_arg_parser().parse_args()
 
-    # 批量实验 GPU 配置（注释掉）：
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     BASE_MODEL,
-    #     trust_remote_code=True,
-    #     device_map="auto",
-    # )
+    # ========= 设备能力推断：无 CUDA 时不要默认开启 bf16/fp16（无卡/小内存环境很容易直接报错） =========
+    has_cuda = torch.cuda.is_available()
+    if not args.bf16 and not args.fp16:
+        # 仅在 CUDA 可用时默认启用 bf16（A100 等）
+        args.bf16 = bool(has_cuda)
+    if not has_cuda and (args.bf16 or args.fp16):
+        warnings.warn("检测到无 CUDA（无卡）环境：已自动关闭 bf16/fp16 以避免运行时报错。", stacklevel=2)
+        args.bf16 = False
+        args.fp16 = False
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    output_dir = args.output_dir or f"project/models/sft/sft_{timestamp}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # WandB：只在需要时初始化，避免集群未登录/离线直接报错
+    wandb_run = None
+    if args.report_to == "wandb":
+        import wandb  # noqa: PLC0415
+
+        wandb_run = wandb.init(project=args.wandb_project, name=(args.run_name or f"sft_{timestamp}"))
+
+    print(f"📁 输出目录: {output_dir}")
+    print("🔧 Loading tokenizer & model...")
+    # HF 鉴权：镜像/Hub 限流或私有模型时需要 token；支持 HF_TOKEN/HUGGINGFACE_HUB_TOKEN
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if not hf_token:
+        token_file = os.environ.get("HF_TOKEN_FILE")
+        token_candidates = [
+            token_file,
+            (os.path.join(os.environ.get("HF_HOME", ""), "token") if os.environ.get("HF_HOME") else None),
+            os.path.expanduser("~/.huggingface/token"),
+            os.path.expanduser("~/.cache/huggingface/token"),
+        ]
+        for p in token_candidates:
+            if not p:
+                continue
+            try:
+                tok = Path(p).read_text(encoding="utf-8").splitlines()[0].strip()
+                if tok:
+                    hf_token = tok
+                    break
+            except Exception:
+                continue
+    # 若没有显式 token，则用 token=True 尝试读取本机已登录凭证（huggingface-cli login）
+    token_arg = hf_token if hf_token else True
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.base_model,
+        trust_remote_code=True,
+        token=token_arg,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # 训练（含 DDP/torchrun）不要用 device_map="auto"，让 Trainer/Accelerate 接管设备放置
+    if args.init_from_config:
+        cfg = AutoConfig.from_pretrained(args.base_model, trust_remote_code=True, token=token_arg)
+        model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            trust_remote_code=True,
+            token=token_arg,
+        )
+    model.config.use_cache = False
+    model.config.pad_token_id = tokenizer.pad_token_id
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
     
     print("🔧 Preparing LoRA config...")
-    # M2 Mac 测试配置 - 使用较小的 r 值以节省内存
+    target_modules = [m.strip() for m in (args.lora_target_modules or "").split(",") if m.strip()]
+    if not target_modules:
+        raise ValueError("--lora_target_modules 不能为空（至少指定一个模块名）")
     lora_config = LoraConfig(
-        r=8,  # 减小 r 值，节省内存
-        lora_alpha=16,  # 相应调整 alpha
-        target_modules=["q_proj","v_proj"],
-        lora_dropout=0.05,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=args.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM"
     )
 
-    # 批量实验 GPU 配置（注释掉）：
-    # lora_config = LoraConfig(
-    #     r=16,  # GPU 环境可以使用更大的 r 值
-    #     lora_alpha=32,
-    #     target_modules=["q_proj","v_proj"],
-    #     lora_dropout=0.05,
-    #     bias="none",
-    #     task_type="CAUSAL_LM"
-    # )
-
-    # M2 Mac CPU 模式 - 不需要 prepare_model_for_kbit_training
     model = get_peft_model(model, lora_config)
 
     print("📥 Loading SFT dataset...")
-    dataset_list = load_sft_dataset(SFT_DATA_PATH)
-
-    # M2 Mac 测试配置 - 使用简单的数据格式
+    dataset_list = load_sft_dataset(args.data_path)
     print(f"   加载了 {len(dataset_list)} 条训练数据")
 
-    # 只处理少量数据进行测试
-    test_dataset_list = dataset_list[:50]  # 只用前10条进行测试
-    print(f"   测试模式：使用 {len(test_dataset_list)} 条数据")
+    if args.max_train_samples and args.max_train_samples > 0:
+        dataset_list = dataset_list[: args.max_train_samples]
+        print(f"   测试模式：使用 {len(dataset_list)} 条数据")
 
-    tokenized_data = []
-    for item in test_dataset_list:
-        tokenized_item = tokenize(item)
-        tokenized_data.append(tokenized_item)
+    train_dataset = Dataset.from_list(dataset_list)
 
-    # 创建简单的 Dataset 类
-    class SimpleDataset:
-        def __init__(self, data):
-            self.data = data
+    def tokenize_batch(examples):
+        return tokenizer(
+            examples["text"],
+            truncation=True,
+            max_length=args.max_length,
+            padding=False,  # 交给 data collator 动态 padding，避免 batch stack 报错
+        )
 
-        def __len__(self):
-            return len(self.data)
-
-        def __getitem__(self, idx):
-            return self.data[idx]
-
-    train_dataset = SimpleDataset(tokenized_data)
+    train_dataset = train_dataset.map(tokenize_batch, batched=True, remove_columns=["text"])
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     print("🚀 Starting SFT training...")
-    # M2 Mac 测试配置 - 启用 WandB 记录
-    training_args = TrainingArguments(
-        output_dir=OUTPUT_DIR,
-        per_device_train_batch_size=1,  # Mac 内存限制，使用小 batch
-        gradient_accumulation_steps=4,  # 减少累积步数，加快训练
-        num_train_epochs=1,  # 测试用，只训练 1 轮
-        logging_steps=1,  # 更频繁的日志输出
-        save_strategy="epoch",
-        learning_rate=2e-4,
-        # fp16=True,  # M2 Mac 不支持 fp16
-        bf16=False,  # M2 Mac CPU 模式下禁用 bf16
-        report_to="wandb",  # 启用 WandB 记录
-        run_name=f"sft_{timestamp}",  # 每次运行的唯一名称
-        # 明确指定 CPU 训练，避免 accelerate 设备检测问题
-        no_cuda=True,
-        dataloader_num_workers=0  # CPU 训练时避免多进程问题
-    )
+    if args.bf16 and args.fp16:
+        raise ValueError("bf16 和 fp16 不能同时开启，请二选一")
 
-    # 批量实验 GPU 配置（注释掉）：
-    # training_args = TrainingArguments(
-    #     output_dir=OUTPUT_DIR,
-    #     per_device_train_batch_size=4,  # GPU 可以用更大 batch
-    #     gradient_accumulation_steps=8,
-    #     num_train_epochs=3,  # 正式训练用 3 轮
-    #     logging_steps=20,
-    #     save_strategy="epoch",
-    #     learning_rate=2e-4,
-    #     fp16=True,  # GPU 支持 fp16，效率更高
-    #     report_to="wandb",  # GPU 环境使用 WandB 记录
-    #     run_name=f"sft_gpu_{timestamp}"
-    # )
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        num_train_epochs=args.num_train_epochs,
+        logging_steps=args.logging_steps,
+        save_strategy=args.save_strategy,
+        learning_rate=args.learning_rate,
+        bf16=args.bf16,
+        fp16=args.fp16,
+        gradient_checkpointing=args.gradient_checkpointing,
+        report_to=("wandb" if args.report_to == "wandb" else []),
+        run_name=(args.run_name or f"sft_{timestamp}"),
+        max_steps=(args.max_steps if args.max_steps and args.max_steps > 0 else -1),
+    )
 
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
+        data_collator=data_collator,
     )
 
     trainer.train()
 
     print("💾 Saving LoRA SFT model...")
-    model.save_pretrained(OUTPUT_DIR)
-    tokenizer.save_pretrained(OUTPUT_DIR)
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
 
     # 获取训练结果
     final_loss = trainer.state.log_history[-1].get("train_loss") if trainer.state.log_history else None
@@ -194,20 +250,20 @@ if __name__ == "__main__":
     metadata = {
         "training_timestamp": timestamp,
         "training_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "base_model": BASE_MODEL,
-        "data_path": SFT_DATA_PATH,
+        "base_model": args.base_model,
+        "data_path": args.data_path,
         "training_config": {
             "epochs": training_args.num_train_epochs,
             "batch_size": training_args.per_device_train_batch_size,
             "gradient_accumulation": training_args.gradient_accumulation_steps,
             "learning_rate": training_args.learning_rate,
-            "max_length": 512,  # tokenize 函数中的值
+            "max_length": args.max_length,
             "lora_r": lora_config.r,
             "lora_alpha": lora_config.lora_alpha,
         },
         "final_loss": final_loss,
         "total_steps": trainer.state.global_step,
-        "output_directory": OUTPUT_DIR,
+        "output_directory": output_dir,
         "files_saved": [
             "adapter_config.json",
             "adapter_model.safetensors",
@@ -222,22 +278,25 @@ if __name__ == "__main__":
         ]
     }
 
-    metadata_path = os.path.join(OUTPUT_DIR, "training_metadata.json")
+    metadata_path = os.path.join(output_dir, "training_metadata.json")
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
 
-    # 记录到 WandB
-    wandb.log({
-        "final_loss": final_loss,
-        "total_steps": trainer.state.global_step,
-        "training_runtime": trainer.state.log_history[-1].get("train_runtime") if trainer.state.log_history else None,
-        "training_config": metadata["training_config"]
-    })
+    if wandb_run is not None:
+        import wandb  # noqa: PLC0415
 
-    # 添加标签和描述
-    wandb.run.tags = ["sft", "qwen3", "lora", "mac_test"]
-    wandb.run.notes = f"SFT training with Qwen3-1.7B on Mac M2. Final loss: {final_loss:.4f}"
+        wandb.log({
+            "final_loss": final_loss,
+            "total_steps": trainer.state.global_step,
+            "training_runtime": trainer.state.log_history[-1].get("train_runtime") if trainer.state.log_history else None,
+            "training_config": metadata["training_config"],
+        })
+
+        wandb.run.tags = ["sft", "qwen3", "lora"]
+        loss_note = f"{final_loss:.4f}" if isinstance(final_loss, (int, float)) else "N/A"
+        wandb.run.notes = f"SFT training with {args.base_model}. Final loss: {loss_note}"
 
     print(f"📝 Training metadata saved to: {metadata_path}")
-    print(f"📊 WandB run URL: {wandb.run.url}")
+    if wandb_run is not None:
+        print(f"📊 WandB run URL: {wandb.run.url}")
     print("🎉 SFT training complete!")
