@@ -1,0 +1,30 @@
+{
+  "training_timestamp": "20260105_1453",
+  "training_datetime": "2026-01-05 15:16:52",
+  "base_model": "Qwen/Qwen3-1.7B",
+  "data_path": "project/data/processed/sft_data.jsonl",
+  "training_config": {
+    "epochs": 3,
+    "batch_size": 6,
+    "gradient_accumulation": 4,
+    "learning_rate": 0.0002,
+    "max_length": 2048,
+    "lora_r": 16,
+    "lora_alpha": 32
+  },
+  "final_loss": 2.4348139775594078,
+  "total_steps": 375,
+  "output_directory": "project/models/sft/sft_20260105_1453",
+  "files_saved": [
+    "adapter_config.json",
+    "adapter_model.safetensors",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "vocab.json",
+    "merges.txt",
+    "added_tokens.json",
+    "chat_template.jinja",
+    "training_metadata.json"
+  ]
+}

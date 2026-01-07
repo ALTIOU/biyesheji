@@ -41,4 +41,17 @@ project/**/checkpoint-*/
 
 # Logs
 *.log
+# === Allow-list: keep ONE specific SFT run in git (for sharing / cloning) ===
+# NOTE: We still ignore other training outputs/models by default.
+!project/models/
+!project/models/sft/
+!project/models/sft/sft_20260105_1453/
+!project/models/sft/sft_20260105_1453/**
 
+# Override generic checkpoint/weight ignores for the allowed SFT run only
+!project/models/sft/sft_20260105_1453/**/checkpoint-*/
+!project/models/sft/sft_20260105_1453/**/checkpoint-*/**
+!project/models/sft/sft_20260105_1453/**/*.safetensors
+!project/models/sft/sft_20260105_1453/**/*.bin
+!project/models/sft/sft_20260105_1453/**/*.pt
+!project/models/sft/sft_20260105_1453/**/*.pth
