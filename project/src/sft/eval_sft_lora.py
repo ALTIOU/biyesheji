@@ -154,6 +154,79 @@ def build_prompt(item: dict) -> str:
     return instruction + (("\n" + inp) if inp else "")
 
 
+def load_prompts(prompts_path: str) -> List[dict]:
+    """
+    支持两种格式：
+    - .txt：每行一个 prompt
+    - .jsonl：每行一个 JSON，优先取 prompt 字段，否则按 instruction/input 拼接
+
+    返回：[{id, prompt, reference?}...]
+    """
+    p = Path(prompts_path)
+    if not p.exists():
+        raise FileNotFoundError(f"prompts_path 不存在：{prompts_path}")
+
+    items: List[dict] = []
+    if p.suffix.lower() == ".txt":
+        for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), start=1):
+            s = line.strip()
+            if not s:
+                continue
+            items.append({"id": str(i), "prompt": s})
+        return items
+
+    if p.suffix.lower() == ".jsonl":
+        raw = load_jsonl(str(p))
+        for i, it in enumerate(raw, start=1):
+            if not isinstance(it, dict):
+                continue
+            prompt = (it.get("prompt") or "").strip()
+            if not prompt:
+                prompt = build_prompt(it).strip()
+            if not prompt:
+                continue
+            rid = str(it.get("id") or i)
+            out = {"id": rid, "prompt": prompt}
+            if "reference" in it and isinstance(it.get("reference"), str):
+                out["reference"] = it["reference"].strip()
+            elif "output" in it and isinstance(it.get("output"), str):
+                out["reference"] = it["output"].strip()
+            items.append(out)
+        return items
+
+    raise ValueError("prompts_path 仅支持 .txt 或 .jsonl")
+
+
+def normalize_text(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def check_prompts_unseen(prompts: List[dict], data_path: str) -> List[dict]:
+    """
+    粗略检查：prompt 是否与训练/数据集里的 prompt 完全一致（做了空白归一化）。
+    返回命中的 prompts 列表（可能为空）。
+    """
+    try:
+        items = load_jsonl(data_path)
+    except Exception:
+        return []
+
+    seen = set()
+    for it in items:
+        try:
+            seen.add(normalize_text(build_prompt(it)))
+        except Exception:
+            continue
+
+    hits = []
+    for p in prompts:
+        if normalize_text(p.get("prompt", "")) in seen:
+            hits.append(p)
+    return hits
+
+
 def resolve_base_model(adapter_dir: str, base_model_arg: str | None) -> str:
     if base_model_arg:
         return base_model_arg
@@ -206,6 +279,91 @@ def load_base_only(base_model: str):
     return model, tokenizer
 
 
+def load_tokenizer_for_compare(base_model: str, adapter_dir: str):
+    """
+    对比模式尽量用同一个 tokenizer：优先用 adapter_dir（训练时保存的 tokenizer），没有则用 base_model。
+    """
+    src = adapter_dir if Path(adapter_dir).exists() else base_model
+    tok = AutoTokenizer.from_pretrained(src, trust_remote_code=True, **maybe_token_kwargs())
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    return tok
+
+
+def save_jsonl(path: str, rows: List[dict]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def save_markdown_compare(path: str, rows: List[dict], title: str) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    lines: List[str] = []
+    lines.append(f"# {title}")
+    lines.append("")
+    for r in rows:
+        rid = r.get("id", "")
+        prompt = r.get("prompt", "")
+        base_out = r.get("base_output", "")
+        sft_out = r.get("sft_output", "")
+        lines.append(f"## id={rid}")
+        lines.append("")
+        lines.append("### Prompt")
+        lines.append("```")
+        lines.append(str(prompt))
+        lines.append("```")
+        lines.append("")
+        lines.append("### Base 输出")
+        lines.append("```")
+        lines.append(str(base_out))
+        lines.append("```")
+        lines.append("")
+        lines.append("### SFT-LoRA 输出")
+        lines.append("```")
+        lines.append(str(sft_out))
+        lines.append("```")
+        lines.append("")
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
+@torch.no_grad()
+def nll_per_token(
+    model,
+    tokenizer,
+    prompt: str,
+    reference: str,
+    max_length: int = 2048,
+) -> float:
+    """
+    计算 teacher-forcing 的平均 NLL（per-token loss），只对 reference 部分计入 loss。
+    这能更直接衡量“给定 summary 是否更会写正文”，比单次采样生成更稳定。
+
+    注意：为避免 OOM/过长，这里对 prompt+reference 做截断。
+    """
+    prompt_ids = tokenizer(prompt, add_special_tokens=False).get("input_ids", [])
+    ref_ids = tokenizer(reference, add_special_tokens=False).get("input_ids", [])
+    if not ref_ids:
+        return float("nan")
+
+    input_ids = (prompt_ids + ref_ids)[:max_length]
+    # labels：prompt 部分不计 loss
+    labels = ([-100] * min(len(prompt_ids), max_length) + ref_ids)[:max_length]
+
+    input_ids_t = torch.tensor([input_ids], dtype=torch.long)
+    labels_t = torch.tensor([labels], dtype=torch.long)
+    attn = torch.ones_like(input_ids_t)
+
+    if torch.cuda.is_available():
+        input_ids_t = input_ids_t.to(model.device)
+        labels_t = labels_t.to(model.device)
+        attn = attn.to(model.device)
+
+    out = model(input_ids=input_ids_t, attention_mask=attn, labels=labels_t)
+    loss = out.loss
+    return float(loss.item()) if loss is not None else float("nan")
+
+
 @torch.no_grad()
 def generate_one(
     model,
@@ -244,6 +402,15 @@ def main():
     ap.add_argument("--base_model", type=str, default=None, help="不传则尝试从 training_metadata.json 推断")
     ap.add_argument("--no_lora", action="store_true", help="只评测 base_model（不加载 LoRA），用于做 before/after 对比")
 
+    ap.add_argument("--prompts_path", type=str, default=None, help="固定 prompts 文件（.txt 每行一个 或 .jsonl），用于生成示例对比")
+    ap.add_argument("--compare_base", action="store_true", help="固定 prompts 下同时生成 base 和 sft（先 base 再加载 LoRA）")
+    ap.add_argument("--check_unseen", action="store_true", help="在 compare/prompts 模式下，检查 prompts 是否与 data_path 的 prompt 完全一致")
+    ap.add_argument("--out_jsonl", type=str, default=None, help="prompts 对比输出 jsonl 路径（仅 prompts/compare 模式）")
+    ap.add_argument("--out_md", type=str, default=None, help="prompts 对比输出 markdown 路径（仅 prompts/compare 模式）")
+    ap.add_argument("--eval_no_sample", action="store_true", help="ROUGE eval 时不 random.sample，按文件顺序取前 eval_size 条（做固定集更稳定）")
+    ap.add_argument("--ppl_eval", action="store_true", help="在 prompts/compare 下额外计算 teacher-forcing NLL/PPL（更稳的能力对比）")
+    ap.add_argument("--ppl_max_length", type=int, default=2048, help="PPL/NLL 评估时的最大 token 长度（prompt+ref 截断）")
+
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--eval_size", type=int, default=200, help="评测样本数（从全量数据随机抽样）")
     ap.add_argument("--num_print", type=int, default=5, help="打印多少条对比样例")
@@ -269,14 +436,6 @@ def main():
     base_model = resolve_base_model(adapter_dir, args.base_model)
     print(f"🔧 base_model: {base_model}")
     print(f"🔧 adapter_dir: {adapter_dir}")
-    print(f"📥 loading data: {args.data_path}")
-    items = load_jsonl(args.data_path)
-    if not items:
-        raise ValueError("数据为空")
-
-    eval_size = min(max(args.eval_size, 1), len(items))
-    eval_items = random.sample(items, eval_size)
-    print(f"🧪 eval_size: {eval_size} / {len(items)}")
 
     # dtype 选择（主要给无卡节省内存用）
     if args.dtype != "auto":
@@ -284,6 +443,200 @@ def main():
             torch.set_default_dtype(torch.float32)
         elif args.dtype == "bf16":
             torch.set_default_dtype(torch.bfloat16)
+
+    # 固定 prompts：用于论文前后对比展示
+    if args.prompts_path:
+        prompts = load_prompts(args.prompts_path)
+        if not prompts:
+            raise ValueError("prompts_path 读取为空，请检查文件内容")
+
+        if args.check_unseen:
+            hits = check_prompts_unseen(prompts, args.data_path)
+            if hits:
+                print("⚠️ 发现 prompts 与 data_path 中的 prompt 完全一致（可能不算未见过）：")
+                for h in hits[:20]:
+                    print(f"- id={h.get('id')} prompt={h.get('prompt')[:80]}")
+                print("建议替换这些 prompts 后再跑。")
+
+        if args.compare_base:
+            print(f"🧪 模式：固定 prompts + base vs SFT-LoRA 对比，共 {len(prompts)} 条")
+            tokenizer = load_tokenizer_for_compare(base_model, adapter_dir)
+            base, _ = load_base_only(base_model)
+
+            rows: List[dict] = []
+            # 先跑 base
+            base_sums = {"rouge1_f1": 0.0, "rouge2_f1": 0.0, "rougeL_f1": 0.0}
+            base_cnt = 0
+            base_nll_sum = 0.0
+            base_nll_cnt = 0
+            for p in prompts:
+                prompt = p["prompt"]
+                base_out = generate_one(
+                    model=base,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    max_new_tokens=args.max_new_tokens,
+                    num_beams=args.num_beams,
+                    do_sample=args.do_sample,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                )
+                row = {"id": p.get("id"), "prompt": prompt, "base_output": base_out}
+                if "reference" in p and isinstance(p.get("reference"), str) and p["reference"].strip():
+                    row["reference"] = p["reference"].strip()
+                    m = rouge_f1(base_out, row["reference"])
+                    row["base_rouge"] = m
+                    for k in base_sums:
+                        base_sums[k] += m[k]
+                    base_cnt += 1
+                    if args.ppl_eval:
+                        nll = nll_per_token(
+                            model=base,
+                            tokenizer=tokenizer,
+                            prompt=prompt,
+                            reference=row["reference"],
+                            max_length=args.ppl_max_length,
+                        )
+                        row["base_nll"] = nll
+                        if nll == nll:  # not nan
+                            base_nll_sum += nll
+                            base_nll_cnt += 1
+                            row["base_ppl"] = float(torch.exp(torch.tensor(nll)).item())
+                rows.append(row)
+
+            # 再加载 LoRA 并跑 SFT
+            sft = PeftModel.from_pretrained(base, adapter_dir)
+            sft.eval()
+            sft_sums = {"rouge1_f1": 0.0, "rouge2_f1": 0.0, "rougeL_f1": 0.0}
+            sft_cnt = 0
+            sft_nll_sum = 0.0
+            sft_nll_cnt = 0
+            for r in rows:
+                sft_out = generate_one(
+                    model=sft,
+                    tokenizer=tokenizer,
+                    prompt=r["prompt"],
+                    max_new_tokens=args.max_new_tokens,
+                    num_beams=args.num_beams,
+                    do_sample=args.do_sample,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                )
+                r["sft_output"] = sft_out
+                if "reference" in r and isinstance(r.get("reference"), str) and r["reference"].strip():
+                    m = rouge_f1(sft_out, r["reference"])
+                    r["sft_rouge"] = m
+                    for k in sft_sums:
+                        sft_sums[k] += m[k]
+                    sft_cnt += 1
+                    if args.ppl_eval:
+                        nll = nll_per_token(
+                            model=sft,
+                            tokenizer=tokenizer,
+                            prompt=r["prompt"],
+                            reference=r["reference"],
+                            max_length=args.ppl_max_length,
+                        )
+                        r["sft_nll"] = nll
+                        if nll == nll:
+                            sft_nll_sum += nll
+                            sft_nll_cnt += 1
+                            r["sft_ppl"] = float(torch.exp(torch.tensor(nll)).item())
+
+            if args.out_jsonl:
+                save_jsonl(args.out_jsonl, rows)
+                print(f"💾 已保存：{args.out_jsonl}")
+            if args.out_md:
+                save_markdown_compare(args.out_md, rows, title="SFT 前后对比（固定 prompts）")
+                print(f"💾 已保存：{args.out_md}")
+
+            if base_cnt > 0 and sft_cnt > 0:
+                base_avg = {k: base_sums[k] / base_cnt for k in base_sums}
+                sft_avg = {k: sft_sums[k] / sft_cnt for k in sft_sums}
+                print("\n" + "#" * 88)
+                print(f"✅ 固定集 ROUGE (F1) 平均值（N={base_cnt}，仅对含 reference 的样本计算）：")
+                print("base:", {k: round(v, 4) for k, v in base_avg.items()})
+                print("sft :", {k: round(v, 4) for k, v in sft_avg.items()})
+                if args.ppl_eval and base_nll_cnt > 0 and sft_nll_cnt > 0:
+                    base_nll_avg = base_nll_sum / base_nll_cnt
+                    sft_nll_avg = sft_nll_sum / sft_nll_cnt
+                    print(f"✅ NLL/PPL（teacher-forcing，越低越好；N={base_nll_cnt}）：")
+                    print("base:", {"nll": round(base_nll_avg, 4), "ppl": round(float(torch.exp(torch.tensor(base_nll_avg)).item()), 4)})
+                    print("sft :", {"nll": round(sft_nll_avg, 4), "ppl": round(float(torch.exp(torch.tensor(sft_nll_avg)).item()), 4)})
+                print("#" * 88)
+
+            # 控制台也打印几条，方便快速看
+            for r in rows[: min(args.num_print, len(rows))]:
+                print("\n" + "=" * 88)
+                print(f"id={r.get('id')}")
+                print("- prompt -")
+                print(r.get("prompt"))
+                print("\n- base -")
+                print(r.get("base_output"))
+                print("\n- sft -")
+                print(r.get("sft_output"))
+                if "reference" in r:
+                    print("\n- ref -")
+                    print(r.get("reference"))
+                if "base_rouge" in r or "sft_rouge" in r:
+                    print("\n- rouge -")
+                    if "base_rouge" in r:
+                        print("base:", {k: round(v, 4) for k, v in r["base_rouge"].items()})
+                    if "sft_rouge" in r:
+                        print("sft :", {k: round(v, 4) for k, v in r["sft_rouge"].items()})
+            return
+
+        # 仅 prompts：按 no_lora 决定用 base 或 sft
+        print(f"🧪 模式：固定 prompts 生成（共 {len(prompts)} 条），no_lora={args.no_lora}")
+        tokenizer = load_tokenizer_for_compare(base_model, adapter_dir)
+        if args.no_lora:
+            model, _ = load_base_only(base_model)
+        else:
+            base, _ = load_base_only(base_model)
+            model = PeftModel.from_pretrained(base, adapter_dir)
+            model.eval()
+
+        rows: List[dict] = []
+        for p in prompts:
+            pred = generate_one(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=p["prompt"],
+                max_new_tokens=args.max_new_tokens,
+                num_beams=args.num_beams,
+                do_sample=args.do_sample,
+                temperature=args.temperature,
+                top_p=args.top_p,
+            )
+            row = {"id": p.get("id"), "prompt": p["prompt"], "pred": pred}
+            if "reference" in p:
+                row["reference"] = p["reference"]
+            rows.append(row)
+
+        if args.out_jsonl:
+            save_jsonl(args.out_jsonl, rows)
+            print(f"💾 已保存：{args.out_jsonl}")
+        for r in rows[: min(args.num_print, len(rows))]:
+            print("\n" + "=" * 88)
+            print(f"id={r.get('id')}")
+            print("- prompt -")
+            print(r.get("prompt"))
+            print("\n- pred -")
+            print(r.get("pred"))
+        return
+
+    # 默认：走原来的 ROUGE eval（随机抽样 data_path）
+    print(f"📥 loading data: {args.data_path}")
+    items = load_jsonl(args.data_path)
+    if not items:
+        raise ValueError("数据为空")
+
+    eval_size = min(max(args.eval_size, 1), len(items))
+    if args.eval_no_sample:
+        eval_items = items[:eval_size]
+    else:
+        eval_items = random.sample(items, eval_size)
+    print(f"🧪 eval_size: {eval_size} / {len(items)}")
 
     if args.no_lora:
         print("🧱 模式：base_model only（no_lora）")

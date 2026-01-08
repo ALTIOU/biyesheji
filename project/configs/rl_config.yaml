@@ -1,1 +1,25 @@
-# RL (PPO/GRPO) 配置文件
+# RL (PPO/GRPO) 配置文件（示例）
+#
+# 说明：当前 `src/rl/train_grpo.py` 主要从命令行参数读取配置；这个文件用于你做毕设时
+# 记录每组实验设置（便于复现/写报告）。你也可以后续把脚本改成读取该 yaml。
+
+grpo:
+  base_model: "Qwen/Qwen3-1.7B"
+  sft_adapter_path: "project/models/sft"      # 可填到某次 sft_* 子目录
+  rl_data_path: "project/data/processed/rl_prompts.jsonl"
+  output_dir: "project/models/rl"
+
+  # 采样与训练
+  group_size: 8
+  max_new_tokens: 128
+  max_prompt_length: 512
+  temperature: 1.0
+  top_p: 0.95
+  learning_rate: 1e-5
+  grad_clip: 1.0
+
+  # 冒烟跑通：只取前 N 条 prompt（0 表示全部）
+  max_prompts: 0
+
+  # 奖励函数（用于消融对比）
+  reward_name: "humanlike_v1"   # 可选：simple / humanlike_v1

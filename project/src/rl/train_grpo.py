@@ -22,13 +22,13 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from peft import PeftModel
 
-# 简易 reward（先跑通流程）
+# Reward 选择（保持接口为 text->float，便于做奖励函数消融）
 # 同目录导入：允许直接用 `python project/src/rl/train_grpo.py` 运行
 try:
-    from reward_functions import simple_reward  # type: ignore
+    from reward_functions import get_reward_fn  # type: ignore
 except Exception:  # pragma: no cover
     # 兼容以 package 方式运行：python -m project.src.rl.train_grpo
-    from project.src.rl.reward_functions import simple_reward  # type: ignore
+    from project.src.rl.reward_functions import get_reward_fn  # type: ignore
 
 # =====================
 # 基础配置
@@ -150,6 +150,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max_new_tokens", type=int, default=128)
     p.add_argument("--learning_rate", type=float, default=1e-5)
     p.add_argument("--max_prompts", type=int, default=0, help=">0 时仅取前 N 条 prompt（适合冒烟/小跑）")
+    p.add_argument(
+        "--reward_name",
+        type=str,
+        default="simple",
+        help="奖励函数名：simple / humanlike_v1（更多可在 src/rl/reward_functions.py 扩展）",
+    )
 
     p.add_argument("--max_prompt_length", type=int, default=512)
     p.add_argument("--temperature", type=float, default=1.0)
@@ -229,6 +235,7 @@ def main():
     model.train()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    reward_fn = get_reward_fn(args.reward_name)
 
     prompts = load_rl_prompts(args.rl_data_path)
     if args.max_prompts and args.max_prompts > 0:
@@ -270,7 +277,7 @@ def main():
             response_ids = output_ids[:, prompt_len:]
             response_text = tokenizer.decode(response_ids[0], skip_special_tokens=True)
 
-            reward = simple_reward(response_text)
+            reward = reward_fn(response_text)
             rewards.append(reward)
             cached.append((output_ids, prompt_len))
 
@@ -333,7 +340,7 @@ GPU / 云端正式实验修改说明
 
 2. GROUP_SIZE: 8 ~ 16
 3. prompts: 使用完整 300 条
-4. reward: 替换为 DetectGPT / GPTZero / 组合奖励
+4. reward: 做“可解释的写作质量/可读性”奖励消融（避免将检测器当作对抗奖励）
 5. optimizer / lr: 可适当调大
 6. RUN_NAME: grpo_detectgpt_v1 / v2 / v3
 """
