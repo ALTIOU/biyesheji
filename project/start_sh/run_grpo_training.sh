@@ -18,9 +18,11 @@ if command -v conda >/dev/null 2>&1; then
 fi
 
 # WandB：网络不稳可用 offline
-export WANDB_PROJECT="${WANDB_PROJECT:-rl_qwen3_lora}"
+export WANDB_PROJECT="rl_qwen3_lora"
 export WANDB_DIR="${WANDB_DIR:-/root/autodl-tmp/wandb}"
 export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
+export WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-}"
 
 # HuggingFace：尽量和 SFT 一致，避免默认访问 huggingface.co 超时
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
@@ -31,6 +33,38 @@ export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-300}"
 export HF_TOKEN="${HF_TOKEN:-}"
 export HF_TOKEN_FILE="${HF_TOKEN_FILE:-}"
 
+# 可选：加载本地密钥文件（不要提交到仓库）
+# - .env.local 里可以放：WANDB_API_KEY=... / HF_TOKEN=...
+# - 或用 *_FILE 指向仅含一行 token/key 的文件
+if [ -f ".env.local" ]; then
+  set -a
+  # shellcheck source=/dev/null
+  . ".env.local"
+  set +a
+fi
+if [ -z "${WANDB_API_KEY:-}" ] && [ -n "${WANDB_API_KEY_FILE:-}" ] && [ -f "${WANDB_API_KEY_FILE}" ]; then
+  export WANDB_API_KEY
+  WANDB_API_KEY="$(head -n 1 "${WANDB_API_KEY_FILE}" | tr -d '\r\n')"
+fi
+if [ -z "${HF_TOKEN:-}" ] && [ -n "${HF_TOKEN_FILE:-}" ] && [ -f "${HF_TOKEN_FILE}" ]; then
+  export HF_TOKEN
+  HF_TOKEN="$(head -n 1 "${HF_TOKEN_FILE}" | tr -d '\r\n')"
+fi
+
+# 可选：命令行覆盖 W&B 项目名
+# 用法：./start_sh/run_grpo_training.sh --wandb_project rl_qwen3_lora
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --wandb_project)
+      export WANDB_PROJECT="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
 # PyTorch：减少碎片导致的 OOM（GPU 时有用）
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
@@ -38,7 +72,7 @@ cd "${REPO_ROOT}"
 
 # 允许用环境变量覆盖关键超参/路径（A100 40G 生产默认值）
 RUN_NAME="${RUN_NAME:-grpo_$(date +%Y%m%d_%H%M%S)}"
-BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-1.7B}"
+BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-7B}"
 SFT_ADAPTER_PATH="${SFT_ADAPTER_PATH:-project/models/sft}"
 RL_DATA_PATH="${RL_DATA_PATH:-project/data/processed/rl_prompts.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-project/models/rl}"
@@ -50,6 +84,7 @@ REPORT_TO="${REPORT_TO:-wandb}" # wandb / none
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-512}"
 TOP_P="${TOP_P:-0.95}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
+REWARD_NAME="${REWARD_NAME:-humanlike_v1}" # 奖励函数：simple / humanlike_v1 / detectgpt
 
 python -u project/src/rl/train_grpo.py \
   --base_model "${BASE_MODEL}" \
@@ -63,6 +98,7 @@ python -u project/src/rl/train_grpo.py \
   --max_prompt_length "${MAX_PROMPT_LENGTH}" \
   --top_p "${TOP_P}" \
   --temperature "${TEMPERATURE}" \
+  --reward_name "${REWARD_NAME}" \
   --bf16 \
   --device auto \
   --report_to "${REPORT_TO}" \

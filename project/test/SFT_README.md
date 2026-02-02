@@ -41,7 +41,7 @@ python project/src/sft/train_sft_lora.py
 
 ## 训练配置
 
-- **基础模型**: Qwen/Qwen3-1.7B
+- **基础模型**: Qwen/Qwen3-7B
 - **LoRA 配置**: r=8, alpha=16, target_modules=["q_proj","v_proj"]
 - **训练数据**: 3000 条 SFT 数据
 - **批次大小**: 1 (gradient_accumulation=4)

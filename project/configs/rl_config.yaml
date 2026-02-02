@@ -4,7 +4,7 @@
 # 记录每组实验设置（便于复现/写报告）。你也可以后续把脚本改成读取该 yaml。
 
 grpo:
-  base_model: "Qwen/Qwen3-1.7B"
+  base_model: "Qwen/Qwen3-7B"
   sft_adapter_path: "project/models/sft"      # 可填到某次 sft_* 子目录
   rl_data_path: "project/data/processed/rl_prompts.jsonl"
   output_dir: "project/models/rl"

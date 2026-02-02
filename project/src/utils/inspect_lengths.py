@@ -24,7 +24,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="JSONL 长度统计（char/token）")
     p.add_argument("--jsonl_path", type=str, required=True)
     p.add_argument("--format", type=str, default="sft", choices=["sft", "rl"])
-    p.add_argument("--tokenizer", type=str, default="Qwen/Qwen3-1.7B")
+    p.add_argument("--tokenizer", type=str, default="Qwen/Qwen3-7B")
     p.add_argument("--max_length", type=int, default=0, help=">0 时额外统计超过该长度的比例")
     p.add_argument("--limit", type=int, default=0, help=">0 时只统计前 N 条（加速）")
     return p

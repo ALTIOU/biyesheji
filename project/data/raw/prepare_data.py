@@ -236,20 +236,41 @@ print(f"[OK] Eval set written: {OUTPUT_DIR}/eval_sft_10.jsonl")
 
 
 # =============================
-# 第 7 步：制作测试集（人类文本，仅正文，用于检测任务）
+# 第 7 步：制作测试集（人类文本，用于检测任务）
 # =============================
 
-print("Generating test set (Human, document-only)...")
+print("Generating test set (Human texts)...")
 
 test_start = eval_end
 test_end = eval_end + TEST_HUMAN_SIZE
-test_human = documents[test_start:test_end]
 
+# 保存两个版本：
+# 1. test_human.jsonl - 仅正文（兼容旧代码）
+# 2. test_human_with_prompt.jsonl - 包含prompt-text配对（用于评估）
+
+# 版本1：仅正文
+test_human = documents[test_start:test_end]
 with open(f"{OUTPUT_DIR}/test_human.jsonl", "w", encoding="utf-8") as f:
     for t in test_human:
         f.write(json.dumps({"text": t}, ensure_ascii=False) + "\n")
 
-print(f"[OK] Human test set written: {OUTPUT_DIR}/test_human.jsonl")
+print(f"[OK] Human test set (text only): {OUTPUT_DIR}/test_human.jsonl")
+
+# 版本2：包含prompt（summary）和text（document）
+test_human_with_prompt = []
+for i in range(test_start, test_end):
+    assert_no_cjk(summaries[i], "test_human.prompt")
+    assert_no_cjk(documents[i], "test_human.text")
+    test_human_with_prompt.append({
+        "prompt": summaries[i],  # 摘要作为prompt
+        "text": documents[i]      # 完整文章作为参考答案
+    })
+
+with open(f"{OUTPUT_DIR}/test_human_with_prompt.jsonl", "w", encoding="utf-8") as f:
+    for item in test_human_with_prompt:
+        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+print(f"[OK] Human test set (with prompt): {OUTPUT_DIR}/test_human_with_prompt.jsonl")
 
 
 # =============================
@@ -271,5 +292,6 @@ print(f"{OUTPUT_DIR}/")
 print("- sft_data.jsonl")
 print("- rl_prompts.jsonl")
 print("- eval_sft_10.jsonl")
-print("- test_human.jsonl")
+print("- test_human.jsonl (text only, for backward compatibility)")
+print("- test_human_with_prompt.jsonl (NEW: with prompt-text pairs for evaluation)")
 print("- test_ai_placeholder.jsonl")

@@ -24,7 +24,7 @@ export WANDB_DIR="${WANDB_DIR:-/root/autodl-tmp/wandb}"
 
 mkdir -p "${HF_HOME}" "${WANDB_DIR}" /root/autodl-tmp/smoke
 
-BIG_MODEL="${BIG_MODEL:-Qwen/Qwen3-1.7B}"
+BIG_MODEL="${BIG_MODEL:-Qwen/Qwen3-7B}"
 SFT_JSONL="${SFT_JSONL:-project/data/processed/sft_data.jsonl}"
 RL_JSONL="${RL_JSONL:-project/data/processed/rl_prompts.jsonl}"
 MAX_LENGTH="${MAX_LENGTH:-2048}"
@@ -34,7 +34,7 @@ python - <<'PY'
 import os
 from huggingface_hub import snapshot_download
 
-repo_id = os.environ.get("BIG_MODEL", "Qwen/Qwen3-1.7B")
+repo_id = os.environ.get("BIG_MODEL", "Qwen/Qwen3-7B")
 token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN") or True
 print(f"Downloading snapshot: {repo_id}")
 path = snapshot_download(repo_id=repo_id, token=token, ignore_patterns=["*.h5", "*.ot", "*.msgpack"])

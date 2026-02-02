@@ -2,11 +2,6 @@
 GRPO 强化学习训练脚本
 
 目标：在 SFT LoRA 的基础上，用 group-based reward（GRPO）继续优化生成质量。
-
-设计目标：
-- AutoDL 上可一键运行（配合 project/start_sh/run_grpo_training.sh）
-- 支持无卡环境“冒烟跑通”（tiny 模型 + 极少 prompts）
-- GPU 来了后只需调参即可满载训练
 """
 
 import os
@@ -33,7 +28,7 @@ except Exception:  # pragma: no cover
 # =====================
 # 基础配置
 # =====================
-DEFAULT_BASE_MODEL = "Qwen/Qwen3-1.7B"
+DEFAULT_BASE_MODEL = "Qwen/Qwen3-7B"
 DEFAULT_SFT_ADAPTER_PATH = "project/models/sft"
 DEFAULT_RL_DATA_PATH = "project/data/processed/rl_prompts.jsonl"
 DEFAULT_OUTPUT_DIR = "project/models/rl"
@@ -147,7 +142,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR)
 
     p.add_argument("--group_size", type=int, default=8, help="每个 prompt 采样 K 个回答")
-    p.add_argument("--max_new_tokens", type=int, default=128)
+    p.add_argument("--max_new_tokens", type=int, default=192)
     p.add_argument("--learning_rate", type=float, default=1e-5)
     p.add_argument("--max_prompts", type=int, default=0, help=">0 时仅取前 N 条 prompt（适合冒烟/小跑）")
     p.add_argument(
@@ -173,6 +168,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="仅从 config 随机初始化模型（不加载权重）。用于无卡/低内存/torch.load 受限环境冒烟跑通。",
     )
+    
+    # 训练优化参数
+    p.add_argument("--warmup_steps", type=int, default=0, help="学习率warmup步数（推荐10-20）")
+    p.add_argument("--early_stopping_patience", type=int, default=0, help="Early stopping耐心值（>0启用，推荐20）")
+    
     return p
 
 
@@ -243,6 +243,11 @@ def main():
     if not prompts:
         raise ValueError("rl_data_path 里没有任何 prompt")
     global_step = 0
+    
+    # Early stopping 跟踪变量
+    best_reward_mean = float('-inf')
+    patience_counter = 0
+    early_stopped = False
 
     for step, prompt in enumerate(prompts):
         # 先采样拿到 rewards，再逐个计算 logprob 并立刻反传（避免同时保留 K 个计算图导致显存飙升）
@@ -305,18 +310,49 @@ def main():
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
+        
+        # ====== Warmup Learning Rate ======
+        if args.warmup_steps > 0 and global_step < args.warmup_steps:
+            # Linear warmup: lr = base_lr * (step / warmup_steps)
+            warmup_factor = (global_step + 1) / args.warmup_steps
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = args.learning_rate * warmup_factor
+        else:
+            # 恢复正常学习率
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = args.learning_rate
+        
+        current_reward_mean = rewards_t.mean().item()
+        current_lr = optimizer.param_groups[0]['lr']
 
         if wandb_run is not None:
             import wandb  # noqa: PLC0415
 
             wandb.log({
                 "loss": loss_val,
-                "reward_mean": rewards_t.mean().item(),
+                "reward_mean": current_reward_mean,
                 "reward_std": rewards_t.std().item(),
+                "learning_rate": current_lr,
                 "prompt_idx": step,
             }, step=global_step)
 
-        print(f"Prompt {step} | Loss {loss_val:.4f} | Reward mean {rewards_t.mean():.4f}")
+        print(f"Prompt {step} | Loss {loss_val:.4f} | Reward mean {current_reward_mean:.4f} | LR {current_lr:.2e}")
+        
+        # ====== Early Stopping ======
+        if args.early_stopping_patience > 0:
+            if current_reward_mean > best_reward_mean:
+                best_reward_mean = current_reward_mean
+                patience_counter = 0
+                print(f"  → New best reward: {best_reward_mean:.4f}")
+            else:
+                patience_counter += 1
+                print(f"  → No improvement ({patience_counter}/{args.early_stopping_patience})")
+                
+                if patience_counter >= args.early_stopping_patience:
+                    print(f"\n[Early Stopping] Triggered after {step + 1} prompts (no improvement for {args.early_stopping_patience} steps)")
+                    early_stopped = True
+                    break
+        
         global_step += 1
 
     # ===== 保存 LoRA 权重 =====
@@ -324,6 +360,12 @@ def main():
     os.makedirs(run_out, exist_ok=True)
     model.save_pretrained(run_out)
     tokenizer.save_pretrained(run_out)
+    
+    if early_stopped:
+        print(f"\n[Success] Training stopped early (best reward: {best_reward_mean:.4f})")
+    else:
+        print(f"\n[Success] Training completed normally")
+    
     print(f"Saved GRPO LoRA to: {run_out}")
 
 

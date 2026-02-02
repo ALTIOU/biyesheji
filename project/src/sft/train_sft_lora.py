@@ -63,7 +63,7 @@ def load_sft_dataset(path):
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="SFT (LoRA) 训练脚本")
     parser.add_argument("--data_path", type=str, default="project/data/processed/sft_data.jsonl")
-    parser.add_argument("--base_model", type=str, default="Qwen/Qwen3-1.7B")
+    parser.add_argument("--base_model", type=str, default="Qwen/Qwen3-7B")
     parser.add_argument("--output_dir", type=str, default=None, help="默认使用 project/models/sft/sft_<timestamp>")
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--max_train_samples", type=int, default=300, help="测试用：限制训练样本数；<=0 表示不限制")

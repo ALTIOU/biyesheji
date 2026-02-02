@@ -55,17 +55,18 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 cd "${REPO_ROOT}"
 
-# 单卡 A100 40G 推荐配置（LoRA + bf16）
-# 目标：显存占用 ~35G（如果 OOM：优先降 BATCH_SIZE；还不行再降 MAX_LENGTH）
-RUN_NAME="sft_a100_40g_$(date +%Y%m%d_%H%M%S)"
+# 单卡 40G 推荐配置（Qwen3-7B, LoRA + bf16）
+# 目标：显存占用 ~35-38G（如果 OOM：优先降 BATCH_SIZE；还不行再降 MAX_LENGTH）
+RUN_NAME="sft_40g_7b_$(date +%Y%m%d_%H%M%S)"
 
 # 允许用环境变量覆盖关键超参
 MAX_LENGTH="${MAX_LENGTH:-2048}"
 MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"   # 0 表示使用全部数据
-BATCH_SIZE="${BATCH_SIZE:-6}"
-GRAD_ACCUM="${GRAD_ACCUM:-4}"
+# 7B 在 40G 上的稳妥配置：小 batch + 更高累积
+BATCH_SIZE="${BATCH_SIZE:-2}"
+GRAD_ACCUM="${GRAD_ACCUM:-8}"
 EPOCHS="${EPOCHS:-3}"
-LR="${LR:-2e-4}"
+LR="${LR:-1e-4}"
 LOGGING_STEPS="${LOGGING_STEPS:-10}"
 USE_GC="${USE_GC:-1}" # 1 开启 gradient checkpointing（更稳），0 关闭（更吃显存）
 
@@ -76,7 +77,7 @@ fi
 
 python -u project/src/sft/train_sft_lora.py \
   --data_path project/data/processed/sft_data.jsonl \
-  --base_model Qwen/Qwen3-1.7B \
+  --base_model Qwen/Qwen3-7B \
   --max_length "${MAX_LENGTH}" \
   --max_train_samples "${MAX_TRAIN_SAMPLES}" \
   --per_device_train_batch_size "${BATCH_SIZE}" \

@@ -65,7 +65,7 @@ def test_tokenizer():
     try:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B", trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-7B", trust_remote_code=True)
         print("✅ Tokenizer 加载成功")
 
         # 测试编码
